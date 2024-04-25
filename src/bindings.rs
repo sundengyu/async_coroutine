@@ -231,13 +231,7 @@ pub unsafe extern "C" fn submit_read(
     size: u64,
     arg: *mut c_void,
 ) {
-    AsyncCoroutine::tls_coroutine().poll_until_ready(async_io::submit_read(
-        fd,
-        offset,
-        buf as *mut u8,
-        size,
-        arg,
-    ));
+    async_io::submit_read(fd, offset, buf as *mut u8, size, arg);
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -248,16 +242,10 @@ pub unsafe extern "C" fn submit_write(
     size: u64,
     arg: *mut c_void,
 ) {
-    AsyncCoroutine::tls_coroutine().poll_until_ready(async_io::submit_write(
-        fd,
-        offset,
-        buf as *const u8,
-        size,
-        arg,
-    ));
+    async_io::submit_write(fd, offset, buf as *const u8, size, arg);
 }
 
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn submit_fsync(fd: i32, arg: *mut c_void) {
-    AsyncCoroutine::tls_coroutine().poll_until_ready(async_io::submit_fsync(fd, arg));
+    async_io::submit_fsync(fd, arg);
 }

@@ -12,25 +12,10 @@ use std::ptr::{self, NonNull};
 use std::task::Context;
 use std::task::Poll;
 
-unsafe extern "C" fn task_runner<A, B>(_: intptr_t) {
-    let tls_coroutine = AsyncCoroutine::tls_coroutine();
-    let func: extern "C" fn(&A) -> B = transmute(tls_coroutine.func);
-    let arg = &*(tls_coroutine.arg as *const A);
-    let ret = tls_coroutine.ret as *mut B;
-    *ret = func(arg);
-    tls_coroutine.state = RunState::Done;
-    jump_fcontext(
-        &mut tls_coroutine.pollee_context,
-        tls_coroutine.poller_context,
-        0,
-        1,
-    );
-}
-
 unsafe extern "C" fn task_runner_c(_: intptr_t) {
     let tls_coroutine = AsyncCoroutine::tls_coroutine();
     let func: unsafe extern "C" fn(*mut c_void) -> *mut c_void = transmute(tls_coroutine.func);
-    tls_coroutine.ret = func(tls_coroutine.ret);
+    tls_coroutine.ret = func(tls_coroutine.arg);
     tls_coroutine.state = RunState::Done;
     jump_fcontext(
         &mut tls_coroutine.pollee_context,
@@ -61,7 +46,7 @@ pub struct AsyncCoroutine {
     stack: Option<Stack>,
     context: Option<NonNull<Context<'static>>>,
     state: RunState,
-    arg: *const c_void,
+    arg: *mut c_void,
     ret: *mut c_void,
     func: usize,
     specific: HashMap<u32, *mut c_void>,
@@ -92,40 +77,12 @@ impl AsyncCoroutine {
             stack: Some(stack),
             context: None,
             state: RunState::Runnable,
-            arg: std::ptr::null(),
-            ret: arg,
-            func: func as usize,
-            specific: HashMap::new(),
-            saved_errno: 0,
-        }
-    }
-
-    #[inline]
-    fn new<A, B>(func: extern "C" fn(&A) -> B, arg: &A, ret: &mut B) -> Self {
-        let stack = fetch_or_alloc_stack(STACK_SIZE);
-        let pollee_context =
-            unsafe { make_fcontext(stack.stack_bottom, STACK_SIZE, Some(task_runner::<A, B>)) };
-        let arg = arg as *const A as *const c_void;
-        let ret = ret as *mut B as *mut c_void;
-        Self {
-            poller_context: ptr::null_mut(),
-            pollee_context,
-            id: stack.stack_id,
-            stack: Some(stack),
-            context: None,
-            state: RunState::Runnable,
             arg,
-            ret,
+            ret: std::ptr::null_mut(),
             func: func as usize,
             specific: HashMap::new(),
             saved_errno: 0,
         }
-    }
-
-    pub async fn run_in_coroutine<A, B: Default>(func: extern "C" fn(&A) -> B, arg: &A) -> B {
-        let mut ret = B::default();
-        Self::new(func, arg, &mut ret).fuse().await;
-        ret
     }
 
     #[inline]

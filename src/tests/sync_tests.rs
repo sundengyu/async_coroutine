@@ -1,6 +1,6 @@
 use crate::bindings::{
     co_cond_broadcast, co_cond_destroy, co_cond_wait, co_mutex_destroy, co_mutex_lock,
-    co_mutex_unlock, co_rw_lock_read, co_rw_lock_write, co_rw_unlock,
+    co_mutex_unlock, co_rw_lock_read, co_rw_lock_write, co_rw_unlock, co_sleep,
 };
 use crate::context::coroutine::AsyncCoroutine;
 use crate::sync::condvar::co_cond_t;
@@ -50,25 +50,32 @@ struct RwlockedValue {
     value: i32,
 }
 
-unsafe extern "C" fn rwlock_worker(arg: *mut c_void) -> *mut c_void {
+unsafe extern "C" fn rwlock_reader(arg: *mut c_void) -> *mut c_void {
+    let value = &mut *(arg as *mut RwlockedValue);
+    co_rw_lock_read(&mut value.lock);
+    let orig_val = value.value;
+    let duration = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 1000000,
+    };
+    co_sleep(&duration);
+    assert_eq!(orig_val, value.value);
+    co_rw_unlock(&mut value.lock);
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn rwlock_writer(arg: *mut c_void) -> *mut c_void {
     let value = &mut *(arg as *mut RwlockedValue);
     co_rw_lock_write(&mut value.lock);
     value.value += 1;
-    co_rw_unlock(&mut value.lock);
-
-    co_rw_lock_read(&mut value.lock);
-    let orig_val = value.value;
-    for _ in 0..10 {
-        assert_eq!(orig_val, value.value);
-    }
     co_rw_unlock(&mut value.lock);
     std::ptr::null_mut()
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rwlock_test() {
-    let concurrency = 128;
-    for _ in 0..1000 {
+    let concurrency = 1024;
+    for _ in 0..100 {
         let mut value = RwlockedValue {
             lock: co_rwlock_t::new(),
             value: 0,
@@ -77,7 +84,13 @@ async fn rwlock_test() {
         for _ in 0..concurrency {
             let coroutine = AsyncCoroutine::new_c(
                 &mut value as *mut RwlockedValue as *mut c_void,
-                rwlock_worker,
+                rwlock_writer,
+            );
+            handles.push(tokio::spawn(coroutine));
+
+            let coroutine = AsyncCoroutine::new_c(
+                &mut value as *mut RwlockedValue as *mut c_void,
+                rwlock_reader,
             );
             handles.push(tokio::spawn(coroutine));
         }

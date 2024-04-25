@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{io::AsyncReadExt, sync::mpsc::*, task::JoinHandle};
+use tokio::{sync::mpsc::*, task::JoinHandle};
 
 unsafe fn io_setup() -> Result<aio_context_t, Error> {
     let mut io_ctx: aio_context_t = 0;
@@ -31,9 +31,10 @@ unsafe fn io_destroy(io_ctx: aio_context_t) -> Result<(), Error> {
     }
 }
 
-unsafe fn io_submit(io_ctx: aio_context_t, iocbs: &[iocb]) -> Result<usize, Error> {
+unsafe fn io_submit(io_ctx: aio_context_t, iocbs: &[iocb]) -> Result<(), Error> {
     let iocb_ptrs: Vec<_> = iocbs.iter().map(|iocb| iocb as *const iocb).collect();
-    loop {
+    let mut nsubmitted = 0;
+    while nsubmitted < iocb_ptrs.len() {
         let ret = libc::syscall(
             libc::SYS_io_submit,
             io_ctx,
@@ -41,38 +42,45 @@ unsafe fn io_submit(io_ctx: aio_context_t, iocbs: &[iocb]) -> Result<usize, Erro
             iocb_ptrs.as_ptr(),
         );
         if ret > 0 {
-            return Ok(ret as usize);
+            nsubmitted += ret as usize;
+            continue;
         }
 
         let err = Error::last_os_error();
-        if err.kind() != ErrorKind::Interrupted {
+        if err.kind() != ErrorKind::Interrupted && err.kind() != ErrorKind::WouldBlock {
             return Err(err);
         }
     }
+
+    Ok(())
 }
 
-unsafe fn io_getevents(io_ctx: aio_context_t, max_nr: u64) -> Result<Vec<io_event>, Error> {
-    let mut events: Vec<io_event> = Vec::with_capacity(max_nr as usize);
-    loop {
+unsafe fn io_getevents(io_ctx: aio_context_t, ncompleted: usize) -> Result<Vec<io_event>, Error> {
+    let mut events: Vec<io_event> = Vec::with_capacity(ncompleted);
+    let mut nreaped = 0;
+    while nreaped < ncompleted {
         let ret = libc::syscall(
             libc::SYS_io_getevents,
             io_ctx,
             1,
-            max_nr,
-            events.as_mut_ptr(),
+            (ncompleted - nreaped) as u64,
+            events.as_mut_ptr().add(nreaped),
             std::ptr::null_mut::<libc::timespec>(),
         );
 
         if ret > 0 {
-            events.set_len(ret as usize);
-            return Ok(events);
+            nreaped += ret as usize;
+            continue;
         }
 
         let err = Error::last_os_error();
-        if err.kind() != ErrorKind::Interrupted {
+        if err.kind() != ErrorKind::Interrupted && err.kind() != ErrorKind::WouldBlock {
             return Err(err);
         }
     }
+
+    events.set_len(ncompleted);
+    Ok(events)
 }
 
 #[derive(Default)]
@@ -103,7 +111,7 @@ struct AioContex {
     eventfd: EventFd,
     nr_requests: u32,
     inflight_reqs: u32,
-    receiver: Option<Receiver<AioCallback>>,
+    receiver: Option<UnboundedReceiver<AioCallback>>,
     cb: unsafe extern "C" fn(arg: *mut libc::c_void, res: i64),
 }
 
@@ -111,7 +119,7 @@ impl AioContex {
     fn new(
         io_fd: i32,
         nr_requests: u32,
-        receiver: Receiver<AioCallback>,
+        receiver: UnboundedReceiver<AioCallback>,
         cb: unsafe extern "C" fn(arg: *mut libc::c_void, res: i64),
     ) -> Result<Self, Error> {
         let io_ctx = unsafe { io_setup()? };
@@ -149,7 +157,7 @@ impl AioContex {
                     aio_nbytes: aio_cb.io_content.size,
                     aio_offset: aio_cb.io_content.offset as i64,
                     aio_reserved2: 0,
-                    aio_flags: 0,
+                    aio_flags: IOCB_FLAG_RESFD,
                     aio_resfd: self.eventfd.raw_fd() as u32,
                 };
                 iocb.aio_data = aio_cb.arg as u64;
@@ -160,19 +168,17 @@ impl AioContex {
         unsafe { io_submit(self.io_ctx, &iocbs).unwrap() };
     }
 
-    fn reap_tasks(&mut self, mut ncompleted: u64) {
-        while ncompleted > 0 {
-            let completions = unsafe { io_getevents(self.io_ctx, ncompleted).unwrap() };
-            ncompleted -= completions.len() as u64;
-            for completion in completions {
-                unsafe { (self.cb)(completion.data as *mut libc::c_void, completion.res) };
-                self.inflight_reqs -= 1;
-            }
+    fn reap_tasks(&mut self, ncompleted: u64) {
+        let completions = unsafe { io_getevents(self.io_ctx, ncompleted as usize).unwrap() };
+        assert_eq!(ncompleted, completions.len() as u64);
+        for completion in completions {
+            unsafe { (self.cb)(completion.data as *mut libc::c_void, completion.res) };
+            self.inflight_reqs -= 1;
         }
     }
 
     async fn recv_many(
-        receiver: &mut Receiver<AioCallback>,
+        receiver: &mut UnboundedReceiver<AioCallback>,
         limit: usize,
     ) -> Result<Vec<AioCallback>, ()> {
         let mut tasks = Vec::with_capacity(limit);
@@ -196,12 +202,12 @@ impl AioContex {
                     tasks = Self::recv_many(&mut receiver, limit as usize) => {
                         self.submit_tasks(tasks?);
                     }
-                    ncompleted = self.eventfd.read_u64() => {
+                    ncompleted = self.eventfd.read_events() => {
                         self.reap_tasks(ncompleted.unwrap());
                     }
                 }
             } else {
-                let ncompleted = self.eventfd.read_u64().await.unwrap();
+                let ncompleted = self.eventfd.read_events().await.unwrap();
                 self.reap_tasks(ncompleted);
             }
         }
@@ -215,7 +221,7 @@ impl Drop for AioContex {
 }
 
 struct AioHandle {
-    sender: Sender<AioCallback>,
+    sender: UnboundedSender<AioCallback>,
     task_handle: JoinHandle<()>,
 }
 
@@ -226,7 +232,7 @@ pub(crate) fn register_fd(
     nr_requests: u32,
     cb: unsafe extern "C" fn(arg: *mut libc::c_void, res: i64),
 ) {
-    let (sender, receiver) = channel(nr_requests as usize);
+    let (sender, receiver) = unbounded_channel();
     let mut aio_context = AioContex::new(fd, nr_requests, receiver, cb).unwrap();
     let task_handle = tokio::spawn(async move {
         let _ = aio_context.submit_and_reap_tasks().await;
@@ -250,13 +256,7 @@ pub(crate) async fn unregister_fd(fd: i32) {
     }
 }
 
-pub(crate) async fn submit_read(
-    fd: i32,
-    offset: u64,
-    buf: *mut u8,
-    size: u64,
-    arg: *mut libc::c_void,
-) {
+pub(crate) fn submit_read(fd: i32, offset: u64, buf: *mut u8, size: u64, arg: *mut libc::c_void) {
     let ctx = FD_CONTEXT_MAP.get().unwrap().get(&fd).unwrap().clone();
     let io_content = IoContent {
         data_ptr: buf as usize,
@@ -269,11 +269,10 @@ pub(crate) async fn submit_read(
             io_content,
             arg,
         })
-        .await
         .unwrap();
 }
 
-pub(crate) async fn submit_write(
+pub(crate) fn submit_write(
     fd: i32,
     offset: u64,
     buf: *const u8,
@@ -292,11 +291,10 @@ pub(crate) async fn submit_write(
             io_content,
             arg,
         })
-        .await
         .unwrap();
 }
 
-pub(crate) async fn submit_fsync(fd: i32, arg: *mut libc::c_void) {
+pub(crate) fn submit_fsync(fd: i32, arg: *mut libc::c_void) {
     let ctx = FD_CONTEXT_MAP.get().unwrap().get(&fd).unwrap().clone();
     let io_content = IoContent::default();
     ctx.sender
@@ -305,6 +303,5 @@ pub(crate) async fn submit_fsync(fd: i32, arg: *mut libc::c_void) {
             io_content,
             arg,
         })
-        .await
         .unwrap();
 }

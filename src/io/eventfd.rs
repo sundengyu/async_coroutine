@@ -1,19 +1,17 @@
+use futures::ready;
 use std::{
-    fs::File,
-    io::{Error, ErrorKind, Read},
-    mem,
-    os::fd::FromRawFd,
+    io::Error,
+    mem::transmute,
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::io::{unix::AsyncFd, AsyncRead, ReadBuf};
+use tokio::io::{unix::AsyncFd, AsyncRead, AsyncReadExt, ReadBuf};
 
 pub(super) struct EventFd(AsyncFd<i32>);
 
 impl EventFd {
     pub(super) fn new(init: u32) -> Result<Self, Error> {
-        let flags = libc::EFD_NONBLOCK | libc::EFD_CLOEXEC;
-        let fd = unsafe { libc::eventfd(init, flags) };
+        let fd = unsafe { libc::eventfd(init, libc::EFD_CLOEXEC) };
         if fd < 0 {
             Err(Error::last_os_error())
         } else {
@@ -23,6 +21,13 @@ impl EventFd {
 
     pub(super) fn raw_fd(&self) -> i32 {
         self.0.get_ref().to_owned()
+    }
+
+    pub(super) async fn read_events(&mut self) -> Result<u64, Error> {
+        let mut nevents: u64 = 0;
+        let buf: &mut [u8; 8] = unsafe { transmute(&mut nevents) };
+        self.read_exact(buf).await?;
+        Ok(nevents)
     }
 }
 
@@ -43,27 +48,19 @@ impl AsyncRead for EventFd {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), Error>> {
-        loop {
-            match self.0.poll_read_ready(cx)? {
-                Poll::Ready(guard) => {
-                    let unfilled = buf.initialize_unfilled();
-                    let mut f = unsafe { File::from_raw_fd(*guard.get_inner()) };
-                    let res = match f.read(unfilled) {
-                        Ok(nread) => {
-                            assert!(nread == 8);
-                            buf.advance(nread);
-                            Ok(())
-                        }
-                        Err(err) => match err.kind() {
-                            ErrorKind::WouldBlock => continue,
-                            _ => Err(err),
-                        },
-                    };
-                    mem::forget(f);
-                    return Poll::Ready(res);
-                }
-                Poll::Pending => return Poll::Pending,
-            };
-        }
+        let guard = ready!(self.0.poll_read_ready(cx)?);
+        let unfilled = buf.initialize_unfilled();
+        assert_eq!(unfilled.len(), 8);
+        let fd = *guard.get_inner();
+        let res = unsafe { libc::read(fd, unfilled.as_mut_ptr() as *mut libc::c_void, 8) };
+        let res = if res < 0 {
+            Err(Error::last_os_error())
+        } else {
+            buf.advance(8);
+            assert_eq!(res, 8);
+            Ok(())
+        };
+
+        Poll::Ready(res)
     }
 }
