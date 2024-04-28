@@ -58,12 +58,12 @@ const STACK_SIZE: usize = 1 << 20;
 
 impl AsyncCoroutine {
     #[inline]
-    pub(crate) fn tls_coroutine<'a>() -> &'a mut Self {
+    pub fn tls_coroutine<'a>() -> &'a mut Self {
         unsafe { &mut *(TLS_COROUTINE.get() as *mut Self) }
     }
 
     #[inline]
-    pub(crate) fn new_c(
+    pub fn new_c(
         arg: *mut c_void,
         func: unsafe extern "C" fn(arg1: *mut c_void) -> *mut c_void,
     ) -> Self {
@@ -137,7 +137,7 @@ impl AsyncCoroutine {
     }
 
     #[inline]
-    pub(crate) unsafe fn poll_until_ready<F: Future<Output = T>, T>(&mut self, f: F) -> T {
+    pub unsafe fn poll_until_ready<F: Future<Output = T>, T>(&mut self, f: F) -> T {
         tokio::pin!(f);
         loop {
             match f.poll_unpin(self.context.unwrap().as_mut()) {
